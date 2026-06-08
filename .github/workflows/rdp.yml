@@ -1,0 +1,329 @@
+# Auto-generated — AI STV
+name: AI STV Windows VM
+on:
+  workflow_dispatch:
+jobs:
+  aistv-vm:
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        instance_id: [1]
+    runs-on: windows-latest
+    timeout-minutes: 395
+    steps:
+      - uses: actions/checkout@v4
+      - name: AI STV Provision
+        timeout-minutes: 25
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          INSTANCE_ID: ${{ matrix.instance_id }}
+          MACHINE_COUNT: '1'
+          VM_DURATION_MINUTES: '360'
+        run: |
+
+          $ErrorActionPreference = 'Continue'
+          $runTag = if ($env:GITHUB_RUN_ID) { $env:GITHUB_RUN_ID } else { Get-Random -Maximum 99999 }
+          $tsName = if ($env:MACHINE_COUNT -eq '1') { "AISTV-$runTag" } else { "AISTV-$($env:INSTANCE_ID)-$runTag" }
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          Write-Host "=== VM Provisioning Started (instance $($env:INSTANCE_ID)) ==="
+          function Install-NetworkPkg {
+            if (Test-Path -LiteralPath $tsExe) {
+              Write-Host "Network: da cai san"
+              return $true
+            }
+            $exe = Join-Path $env:RUNNER_TEMP "tailscale-setup.exe"
+            Write-Host "Network: tai EXE installer..."
+            try {
+              Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-full-1.98.4.exe" -OutFile $exe -UseBasicParsing -TimeoutSec 120
+              if (Test-Path -LiteralPath $exe) {
+                $p = Start-Process -FilePath $exe -ArgumentList @("/quiet") -Wait -PassThru -NoNewWindow
+                Write-Host "Network EXE exit $($p.ExitCode)"
+                for ($w = 0; $w -lt 20; $w++) {
+                  if (Test-Path -LiteralPath $tsExe) { break }
+                  Start-Sleep -Seconds 2
+                }
+              }
+            } catch {
+              Write-Host "Network EXE loi: $($_.Exception.Message)"
+            }
+            if (Test-Path -LiteralPath $tsExe) { return $true }
+            Write-Host "Network: fallback winget..."
+            $wp = Start-Process -FilePath "winget.exe" -ArgumentList @(
+              "install","--id","Tailscale.Tailscale","-e","--disable-interactivity",
+              "--accept-source-agreements","--accept-package-agreements","--source","winget"
+            ) -Wait -PassThru -NoNewWindow
+            Write-Host "winget exit $($wp.ExitCode)"
+            Start-Sleep -Seconds 5
+            Start-Service -Name "Tailscale" -ErrorAction SilentlyContinue | Out-Null
+            return (Test-Path -LiteralPath $tsExe)
+          }
+          if (-not (Install-NetworkPkg)) {
+            Write-Host "Network: CAI DAT THAT BAI"
+          }
+          function Get-NetworkIPv4 {
+            if (-not (Test-Path -LiteralPath $tsExe)) { return $null }
+            try {
+              $j = & $tsExe status --json 2>$null | ConvertFrom-Json
+              if ($j.Self.Online -eq $true -and $j.Self.TailscaleIPs) {
+                foreach ($a in $j.Self.TailscaleIPs) {
+                  $s = "$a".Trim()
+                  if ($s -match '^(100\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.)\d+\.\d+$' -or $s -match '^\d{1,3}(\.\d{1,3}){3}$') {
+                    return $s
+                  }
+                }
+              }
+            } catch {}
+            foreach ($line in @(& $tsExe ip -4 2>$null)) {
+              $s = "$line".Trim()
+              if ($s -match '^\d{1,3}(\.\d{1,3}){3}$') { return $s }
+            }
+            return $null
+          }
+          if ($env:TAILSCALE_AUTH_KEY -and (Test-Path -LiteralPath $tsExe)) {
+            $tsKey = "$env:TAILSCALE_AUTH_KEY".Trim()
+            Write-Host "Network: khoi dong service..."
+            Set-Service -Name 'Tailscale' -StartupType Automatic -ErrorAction SilentlyContinue
+            Restart-Service -Name 'Tailscale' -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 6
+            Write-Host "Network: dang ket noi (hostname=$tsName)..."
+            & $tsExe up --auth-key=$tsKey --hostname=$tsName --accept-routes --accept-dns=false --timeout=90s 2>&1 | ForEach-Object { Write-Host "net: $_" }
+            $ip = 'pending'
+            for ($t = 0; $t -lt 18; $t++) {
+              $got = Get-NetworkIPv4
+              if ($got) { $ip = $got; Write-Host "Network: IP=$ip"; break }
+              if ($t -lt 3) { Start-Sleep -Seconds 3 } else { Start-Sleep -Seconds 5 }
+            }
+            if ($ip -eq 'pending') {
+              Write-Host "Network: WARN — chua lay duoc IP (kiem tra auth key reusable + ACL)"
+            }
+          } elseif (Test-Path -LiteralPath $tsExe) {
+            $ip = 'pending'
+          } else {
+            Write-Host "Network: khong co — dung IP public"
+            $ip = (Invoke-RestMethod -Uri 'https://api.ipify.org?format=json' -TimeoutSec 30).ip
+          }
+          Write-Host "=== RDP setup ==="
+          $vmUser = 'AISTV'
+          $comp = $env:COMPUTERNAME
+          $rdpTcp = 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
+          Set-ItemProperty -Path $rdpTcp -Name 'UserAuthentication' -Value 1 -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $rdpTcp -Name 'SecurityLayer' -Value 2 -ErrorAction SilentlyContinue
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' | Out-Null
+          Set-Service -Name TermService -StartupType Automatic -ErrorAction SilentlyContinue
+          Restart-Service -Name TermService -Force -ErrorAction SilentlyContinue
+          Write-Host "=== Audio setup ==="
+          try {
+            Set-Service -Name Audiosrv -StartupType Automatic -ErrorAction SilentlyContinue
+            Set-Service -Name AudioEndpointBuilder -StartupType Automatic -ErrorAction SilentlyContinue
+            Start-Service -Name AudioEndpointBuilder -ErrorAction SilentlyContinue
+            Start-Service -Name Audiosrv -ErrorAction SilentlyContinue
+            New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' -Force | Out-Null
+            Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' -Name 'fDisableAudioCapture' -Type DWord -Value 0 -ErrorAction SilentlyContinue
+            Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' -Name 'fDisableCam' -Type DWord -Value 0 -ErrorAction SilentlyContinue
+            Write-Host "Audio: enabled (chon 'Play on this computer' trong Remote Desktop client)"
+          } catch {
+            Write-Host "Audio: WARN $($_.Exception.Message)"
+          }
+          $rand = -join ((48..57)+(65..90)+(97..122) | Get-Random -Count 42 | ForEach-Object { [char]$_ })
+          $password = 'trongphuc_owr' + $rand
+          Remove-LocalUser -Name 'githubvm' -ErrorAction SilentlyContinue
+          $sec = ConvertTo-SecureString $password -AsPlainText -Force
+          if (Get-LocalUser -Name $vmUser -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name $vmUser -Password $sec -PasswordNeverExpires $true -ErrorAction SilentlyContinue
+          } else {
+            New-LocalUser -Name $vmUser -Password $sec -FullName 'AI STV VM' -PasswordNeverExpires -ErrorAction SilentlyContinue
+          }
+          $lu = Get-LocalUser -Name $vmUser -ErrorAction SilentlyContinue
+          if ($lu) { $lu | Enable-LocalUser -ErrorAction SilentlyContinue }
+          Add-LocalGroupMember -Group 'Administrators' -Member $vmUser -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $vmUser -ErrorAction SilentlyContinue
+          $uok = $null -ne $lu
+          $rdpListen = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
+          Write-Host "User created: $vmUser (ok=$uok)"
+          Write-Host "Computer: $comp"
+          Write-Host "Login: $vmUser"
+          Write-Host "Hostname: $tsName"
+          Write-Host "IP: $ip"
+          Write-Host "Username: $vmUser"
+          Write-Host "Password: [hidden - sent by Discord DM/artifact only]"
+          Write-Host "RDP port 3389: $(if ($rdpListen) { 'LISTEN' } else { 'CHUA MO' })"
+          Write-Host "=== Wallpaper & Avatar setup ==="
+          try {
+            $avtWs = if ($env:GITHUB_WORKSPACE) { $env:GITHUB_WORKSPACE } else { (Get-Location).Path }
+            $img0Src = Join-Path $avtWs 'img0.png'
+            $userSrc = Join-Path $avtWs 'user.png'
+            if ((Test-Path -LiteralPath $img0Src) -and (Test-Path -LiteralPath $userSrc)) {
+              $wallPub = "$env:ProgramData\AI_STV"
+              $null = New-Item -Path $wallPub -ItemType Directory -Force
+              Copy-Item -Path $img0Src -Destination (Join-Path $wallPub 'img0.jpg') -Force
+              $wallDest = Join-Path $wallPub 'img0.jpg'
+              Write-Host "Wallpaper: da copy img0.png -> $wallPub\img0.jpg"
+              try {
+                $wallSys = Join-Path $env:windir 'Web\Wallpaper\Windows'
+                $null = New-Item -Path $wallSys -ItemType Directory -Force -ErrorAction Stop
+                Add-Type -AssemblyName System.Drawing
+                $wallBmp = [System.Drawing.Image]::FromFile($img0Src)
+                # img0
+                $sysImg0 = Join-Path $wallSys 'img0.jpg'
+                takeown /F $sysImg0 /A 2>$null
+                icacls $sysImg0 /grant "Administrators:(F)" 2>$null
+                $wallBmp.Save($sysImg0, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+                $wallDest = $sysImg0
+                Write-Host "Wallpaper: da thay img0.jpg"
+                # img19
+                $sysImg19 = Join-Path $wallSys 'img19.jpg'
+                takeown /F $sysImg19 /A 2>$null
+                icacls $sysImg19 /grant "Administrators:(F)" 2>$null
+                $wallBmp.Save($sysImg19, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+                Write-Host "Wallpaper: da thay img19.jpg"
+                # Xoa het img khac, giu lai img0 + img19
+                Get-ChildItem -Path $wallSys -Filter 'img*.jpg' | Where-Object { $_.BaseName -notin @('img0','img19') } | ForEach-Object {
+                  takeown /F $_.FullName /A 2>$null
+                  icacls $_.FullName /grant "Administrators:(F)" 2>$null
+                  Remove-Item -LiteralPath $_.FullName -Force
+                  Write-Host "Wallpaper: da xoa $($_.Name)"
+                }
+                # 4K Wallpaper
+                $wall4k = "$env:windir\Web\4K\Wallpaper\Windows"
+                $null = New-Item -Path $wall4k -ItemType Directory -Force -ErrorAction Stop
+                Get-ChildItem -Path $wall4k -Filter 'img*.jpg' | Where-Object { $_.BaseName -notin @('img0_1920x1200','img19_1920x1200') } | ForEach-Object {
+                  takeown /F $_.FullName /A 2>$null
+                  icacls $_.FullName /grant "Administrators:(F)" 2>$null
+                  Remove-Item -LiteralPath $_.FullName -Force
+                  Write-Host "Wallpaper: da xoa 4K/$($_.Name)"
+                }
+                $sysImg0_4k = Join-Path $wall4k 'img0_1920x1200.jpg'
+                takeown /F $sysImg0_4k /A 2>$null
+                icacls $sysImg0_4k /grant "Administrators:(F)" 2>$null
+                $wallBmp.Save($sysImg0_4k, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+                Write-Host "Wallpaper: da thay 4K/img0_1920x1200.jpg"
+                $sysImg19_4k = Join-Path $wall4k 'img19_1920x1200.jpg'
+                takeown /F $sysImg19_4k /A 2>$null
+                icacls $sysImg19_4k /grant "Administrators:(F)" 2>$null
+                $wallBmp.Save($sysImg19_4k, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+                Write-Host "Wallpaper: da thay 4K/img19_1920x1200.jpg"
+                $wallBmp.Dispose()
+                # Tat Windows Spotlight de khong override wallpaper
+                $null = New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" -Force -ErrorAction SilentlyContinue
+                Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" -Name "DisableWindowsSpotlightFeatures" -Type DWord -Value 1 -ErrorAction SilentlyContinue
+                Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" -Name "DisableWindowsSpotlightOnSettings" -Type DWord -Value 1 -ErrorAction SilentlyContinue
+                Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" -Name "DisableWindowsSpotlightWindowsWelcomeExperience" -Type DWord -Value 1 -ErrorAction SilentlyContinue
+                Write-Host "Wallpaper: da disable Windows Spotlight"
+                Write-Host "Wallpaper: da thay img0, img19, 4K/img0_1920x1200, 4K/img19_1920x1200"
+              } catch {
+                Write-Host "Wallpaper: khong the ghi vao C:\Windows (bo qua)"
+                $wallDest = Join-Path "$env:ProgramData\AI_STV" 'img0.jpg'
+              }
+              $secStr = ConvertTo-SecureString $password -AsPlainText -Force
+              $cred = New-Object System.Management.Automation.PSCredential($vmUser, $secStr)
+              Start-Process -FilePath 'powershell' -Credential $cred -NoNewWindow -ArgumentList '-c whoami' -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 3
+              $sid = (Get-LocalUser -Name $vmUser -ErrorAction SilentlyContinue).SID.Value
+              if ($sid) { Write-Host "Avatar: SID=$sid" }
+              $usrProf = "C:\Users\$vmUser"
+              $ntData = Join-Path $usrProf 'NTUSER.DAT'
+              $acctPicDir = Join-Path $usrProf 'AppData\Roaming\Microsoft\Windows\AccountPictures'
+              if (Test-Path -LiteralPath $ntData) {
+                & reg.exe load "HKU\_AISTV" $ntData 2>$null
+                Start-Sleep -Seconds 1
+                $cuDesktop = "Registry::HKU\_AISTV\Control Panel\Desktop"
+                if (Test-Path -LiteralPath $cuDesktop) {
+                  Set-ItemProperty -Path $cuDesktop -Name 'Wallpaper' -Value $wallDest -ErrorAction SilentlyContinue
+                  Set-ItemProperty -Path $cuDesktop -Name 'WallpaperStyle' -Value '2' -Type DWord -ErrorAction SilentlyContinue
+                  Set-ItemProperty -Path $cuDesktop -Name 'TileWallpaper' -Value '0' -Type DWord -ErrorAction SilentlyContinue
+                  Write-Host "Wallpaper: da set registry cho AISTV"
+                }
+                & reg.exe unload "HKU\_AISTV" 2>$null
+                Remove-Item -Path "$usrProf\AppData\Roaming\Microsoft\Windows\Themes\TranscodedWallpaper" -Force -ErrorAction SilentlyContinue
+                Remove-Item -Path "$usrProf\AppData\Roaming\Microsoft\Windows\Themes\CachedFiles\*" -Recurse -Force -ErrorAction SilentlyContinue
+                Write-Host "Wallpaper: da xoa cache"
+              } else { Write-Host "Wallpaper: NTUSER.DAT chua ton tai" }
+              RUNDLL32.exe user32.dll,UpdatePerUserSystemParameters 2>$null
+              Write-Host "Wallpaper: da refresh"
+              $progDataPicDir = "$env:ProgramData\Microsoft\User Account Pictures"
+              $null = New-Item -Path $progDataPicDir -ItemType Directory -Force
+              Get-ChildItem -Path $progDataPicDir | Where-Object { -not $_.PSIsContainer -and ($_.BaseName -eq 'user' -or $_.BaseName -eq 'User') } | ForEach-Object {
+                takeown /F $_.FullName /A 2>$null
+                icacls $_.FullName /grant "Administrators:(F)" 2>$null
+                Copy-Item -Path $userSrc -Destination $_.FullName -Force
+              }
+              Write-Host "Avatar: da copy user.png -> %ProgramData%\Microsoft\User Account Pictures\user"
+              $null = New-Item -Path $acctPicDir -ItemType Directory -Force
+              Copy-Item -Path $userSrc -Destination (Join-Path $acctPicDir 'user.png') -Force
+              if ($sid) {
+                $acctKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AccountPicture\Users\$sid"
+                $null = New-Item -Path $acctKey -Force
+                Set-ItemProperty -Path $acctKey -Name 'ImagePath' -Value "$acctPicDir\user.png" -ErrorAction SilentlyContinue
+                foreach ($sz in @(32,40,48,64,96,120,128,144,152,192,256)) {
+                  Set-ItemProperty -Path $acctKey -Name "Image$sz" -Value "$acctPicDir\user.png" -ErrorAction SilentlyContinue
+                }
+                Write-Host "Avatar: da set registry avatar"
+              }
+              try {
+                $polPath = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System'
+                $null = New-Item -Path $polPath -Force -ErrorAction Stop
+                Set-ItemProperty -Path $polPath -Name 'Wallpaper' -Value $wallDest -ErrorAction SilentlyContinue
+                Set-ItemProperty -Path $polPath -Name 'WallpaperStyle' -Value '2' -Type DWord -ErrorAction SilentlyContinue
+              } catch {
+                Write-Host "Wallpaper: policy registry khong co quyen — bo qua"
+              }
+            } else {
+              Write-Host "Wallpaper/avatar: KHONG tim thay img0.png hoac user.png trong workspace"
+              Get-ChildItem -Path $avtWs -ErrorAction SilentlyContinue | Select-Object -First 30 | ForEach-Object { Write-Host "WS: $($_.Name)" }
+            }
+          } catch {
+            Write-Host "Wallpaper: loi $($_.Exception.Message)"
+          }
+          # Xoa anh khoi workspace
+          $ws = if ($env:GITHUB_WORKSPACE) { $env:GITHUB_WORKSPACE } else { (Get-Location).Path }
+          Remove-Item -Path (Join-Path $ws 'img0.png') -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path (Join-Path $ws 'img19.png') -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path (Join-Path $ws 'user.png') -Force -ErrorAction SilentlyContinue
+          Write-Host "Cleanup: da xoa img0.png, img19.png, user.png"
+          Write-Host "Wallpaper: da setup hoan tat"
+          Write-Host "=== VM Ready ==="
+          $credsPath = Join-Path $ws 'vm-creds.json'
+          @{
+            hostname = $tsName
+            ip = $ip
+            username = $vmUser
+            password = $password
+            computer = $comp
+            login = $vmUser
+            instance_id = $env:INSTANCE_ID
+          } | ConvertTo-Json | Set-Content -LiteralPath $credsPath -Encoding utf8
+          if (-not (Test-Path -LiteralPath $credsPath)) {
+            Write-Error "vm-creds.json not created"
+            exit 1
+          }
+          exit 0
+
+      - name: Upload VM credentials
+        uses: actions/upload-artifact@v4
+        with:
+          name: aistv-creds-${{ matrix.instance_id }}
+          path: vm-creds.json
+          if-no-files-found: warn
+          retention-days: 1
+      - name: AI STV Keep-Alive
+        shell: pwsh
+        env:
+          INSTANCE_ID: ${{ matrix.instance_id }}
+          MACHINE_COUNT: '1'
+          VM_DURATION_MINUTES: '360'
+        run: |
+
+          $ErrorActionPreference = 'SilentlyContinue'
+          $mins = [int]$env:VM_DURATION_MINUTES
+          if ($mins -lt 1) { $mins = 30 }
+          Write-Host "=== VM Keep-Alive $mins phut (instance $($env:INSTANCE_ID)) ==="
+          $deadline = (Get-Date).AddMinutes($mins)
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 60
+          }
+          Write-Host "=== VM Session Ended (instance $($env:INSTANCE_ID)) ==="
+          exit 0
+
